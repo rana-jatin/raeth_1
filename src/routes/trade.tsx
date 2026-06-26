@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PageShell } from "../components/site-chrome";
 import {
   ChartSkeleton,
@@ -7,6 +7,7 @@ import {
   PanelErrorBoundary,
   useFeedStatus,
 } from "../components/panel-states";
+import { Slider } from "../components/ui/slider";
 import { getRequestOrigin } from "../lib/origin.functions";
 import ogTrade from "../assets/og/trade.jpg";
 import {
@@ -31,13 +32,13 @@ export const Route = createFileRoute("/trade")({
         {
           name: "description",
           content:
-            "Live RAETH testnet trade terminal — switch markets, watch a live order book and chart, and stage simulated orders for BTC perpetuals and binaries.",
+            "Live RAETH testnet trade terminal — glass-box agent thought stream and time-travel debugger over a simulated BTC order book.",
         },
         { property: "og:title", content: "Trade Terminal — RAETH" },
         {
           property: "og:description",
           content:
-            "Switch markets, watch a live order book and chart, and stage simulated orders for BTC perpetuals and binaries.",
+            "Glass-box agent thought stream and time-travel debugger over a simulated BTC order book.",
         },
         { property: "og:type", content: "website" },
         { property: "og:url", content: "/trade" },
@@ -53,10 +54,167 @@ export const Route = createFileRoute("/trade")({
 type Side = "BUY" | "SELL";
 type Order = "LIMIT" | "MARKET";
 
+type BookLevel = { px: number; qty: number };
+type Snapshot = {
+  id: number;
+  t: number;
+  mark: number;
+  bids: BookLevel[];
+  asks: BookLevel[];
+  /** Indicator readouts the agent saw at this instant. */
+  ind: { ema: number; rsi: number; imb: number; vol: number };
+};
+
+type Trigger = { label: string; value: string; pass: boolean };
+type Decision = {
+  id: string;
+  frameId: number;
+  t: number;
+  side: Side;
+  px: number;
+  qty: number;
+  conviction: number; // 0..1
+  monologue: string;
+  triggers: Trigger[];
+};
+
+const FRAME_CAP = 180;
+const FRAME_MS = 850;
+
+function makeBook(market: MarketConfig, mark: number) {
+  const asks = Array.from({ length: 9 }, (_, i) => ({
+    px: mark + (i + 1) * market.tick,
+    qty: +(Math.random() * 4 + 0.2).toFixed(2),
+  })).reverse();
+  const bids = Array.from({ length: 9 }, (_, i) => ({
+    px: mark - (i + 1) * market.tick,
+    qty: +(Math.random() * 4 + 0.2).toFixed(2),
+  }));
+  return { asks, bids };
+}
+
+function bookImbalance(b: BookLevel[], a: BookLevel[]) {
+  const bq = b.reduce((s, r) => s + r.qty, 0);
+  const aq = a.reduce((s, r) => s + r.qty, 0);
+  const total = bq + aq || 1;
+  return (bq - aq) / total; // -1..1
+}
+
 function TradePage() {
   const { symbol } = Route.useSearch();
   const market = getMarket(symbol);
   const mark = useLiveMark(market);
+
+  const [frames, setFrames] = useState<Snapshot[]>([]);
+  const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [viewId, setViewId] = useState<number | null>(null); // null = live
+  const frameSeq = useRef(0);
+  const lastDecision = useRef(0);
+
+  // Reset history when the market changes.
+  useEffect(() => {
+    setFrames([]);
+    setDecisions([]);
+    setViewId(null);
+    frameSeq.current = 0;
+    lastDecision.current = 0;
+  }, [market]);
+
+  // Drive a single shared tick that produces snapshots + occasional agent decisions.
+  useEffect(() => {
+    const id = setInterval(() => {
+      setFrames((prev) => {
+        const { asks, bids } = makeBook(market, mark);
+        const prevMark = prev.length ? prev[prev.length - 1].mark : mark;
+        const ema = prev.length
+          ? prev[prev.length - 1].ind.ema * 0.85 + mark * 0.15
+          : mark;
+        const drift = mark - prevMark;
+        const rsi = Math.max(5, Math.min(95, 50 + drift * 800));
+        const imb = bookImbalance(bids, asks);
+        const vol = Math.abs(drift) / Math.max(1e-6, market.volatility);
+        const snap: Snapshot = {
+          id: ++frameSeq.current,
+          t: Date.now(),
+          mark,
+          bids,
+          asks,
+          ind: { ema, rsi, imb, vol },
+        };
+
+        // Agent decision logic — fires when several signals align.
+        const sinceLast = snap.t - lastDecision.current;
+        if (sinceLast > 2600 && Math.random() > 0.55) {
+          const bullish = imb > 0.08 && mark > ema && rsi < 70;
+          const bearish = imb < -0.08 && mark < ema && rsi > 30;
+          if (bullish || bearish) {
+            lastDecision.current = snap.t;
+            const side: Side = bullish ? "BUY" : "SELL";
+            const conviction = Math.min(
+              0.99,
+              0.45 + Math.abs(imb) * 1.6 + Math.abs(mark - ema) / (ema || 1) * 60,
+            );
+            const triggers: Trigger[] = [
+              {
+                label: "Book imbalance",
+                value: `${(imb * 100).toFixed(1)}%`,
+                pass: bullish ? imb > 0.08 : imb < -0.08,
+              },
+              {
+                label: "Mark vs EMA(20)",
+                value: `${(((mark - ema) / (ema || 1)) * 100).toFixed(2)}%`,
+                pass: bullish ? mark > ema : mark < ema,
+              },
+              {
+                label: "RSI(14)",
+                value: rsi.toFixed(1),
+                pass: bullish ? rsi < 70 : rsi > 30,
+              },
+              {
+                label: "Vol regime",
+                value: vol.toFixed(2),
+                pass: vol < 2.2,
+              },
+            ];
+            const qty = market.type === "perp"
+              ? +(0.05 + conviction * 0.6).toFixed(2)
+              : +(20 + conviction * 120).toFixed(0);
+            const monologue = bullish
+              ? `Bid stack outweighs offers (${(imb * 100).toFixed(1)}% imbalance) while mark sits ${(((mark - ema) / (ema || 1)) * 1e4).toFixed(0)}bps above EMA(20). RSI ${rsi.toFixed(0)} leaves room before overbought. Lifting ${qty} ${market.symbol} at ${fmtPrice(market, mark)} with conviction ${(conviction * 100).toFixed(0)}%.`
+              : `Offers dominate (${(imb * 100).toFixed(1)}% imbalance) and mark broke ${(((ema - mark) / (ema || 1)) * 1e4).toFixed(0)}bps under EMA(20). RSI ${rsi.toFixed(0)} not yet oversold — fading strength. Hitting bid for ${qty} ${market.symbol} at ${fmtPrice(market, mark)}, conviction ${(conviction * 100).toFixed(0)}%.`;
+            const decision: Decision = {
+              id: `ord_${snap.id.toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+              frameId: snap.id,
+              t: snap.t,
+              side,
+              px: mark,
+              qty,
+              conviction,
+              monologue,
+              triggers,
+            };
+            setDecisions((d) => [decision, ...d].slice(0, 40));
+          }
+        }
+
+        const next = [...prev, snap];
+        if (next.length > FRAME_CAP) next.splice(0, next.length - FRAME_CAP);
+        return next;
+      });
+    }, FRAME_MS);
+    return () => clearInterval(id);
+  }, [market, mark]);
+
+  const liveFrame = frames[frames.length - 1];
+  const viewFrame =
+    viewId === null
+      ? liveFrame
+      : frames.find((f) => f.id === viewId) ?? liveFrame;
+  const isLive = viewId === null;
+
+  const jumpToDecision = useCallback((d: Decision) => {
+    setViewId(d.frameId);
+  }, []);
 
   return (
     <PageShell>
@@ -71,21 +229,33 @@ function TradePage() {
             <h1 className="mt-3 text-2xl font-semibold tracking-tight">{market.name}</h1>
             <p className="mt-1 font-mono text-[11px] text-muted-foreground">{market.kind}</p>
           </div>
-          <MarkRibbon market={market} mark={mark} />
+          <MarkRibbon market={market} mark={viewFrame?.mark ?? mark} isLive={isLive} />
         </div>
 
         <div className="mt-5 grid gap-3 lg:grid-cols-[260px_1fr_320px]">
           <PanelErrorBoundary title="Order book unavailable">
-            <OrderBook market={market} mark={mark} />
+            <OrderBook market={market} frame={viewFrame} isLive={isLive} />
           </PanelErrorBoundary>
           <PanelErrorBoundary title="Chart unavailable">
-            <ChartPanel market={market} mark={mark} />
+            <ChartPanel
+              market={market}
+              frames={frames}
+              viewId={viewId}
+              onScrub={setViewId}
+              isLive={isLive}
+              decisions={decisions}
+            />
           </PanelErrorBoundary>
           <OrderTicket market={market} mark={mark} />
         </div>
 
-        <div className="mt-3 grid gap-3 lg:grid-cols-2">
-          <RecentFills market={market} mark={mark} />
+        <div className="mt-3 grid gap-3 lg:grid-cols-[1.4fr_1fr]">
+          <ThoughtStream
+            market={market}
+            decisions={decisions}
+            activeFrameId={viewFrame?.id ?? null}
+            onJump={jumpToDecision}
+          />
           <PositionsTable />
         </div>
       </section>
@@ -114,10 +284,28 @@ function MarketSwitcher({ active }: { active: string }) {
   );
 }
 
-function MarkRibbon({ market, mark }: { market: MarketConfig; mark: number }) {
+function MarkRibbon({
+  market,
+  mark,
+  isLive,
+}: {
+  market: MarketConfig;
+  mark: number;
+  isLive: boolean;
+}) {
+  const tag = isLive ? (
+    <span className="rounded border border-live/40 bg-live/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-live">
+      ● live
+    </span>
+  ) : (
+    <span className="rounded border border-accent/40 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-accent">
+      ⏪ rewind
+    </span>
+  );
   if (market.type === "perp") {
     return (
       <div className="flex flex-wrap items-center gap-5 font-mono text-xs tabular-nums">
+        {tag}
         <Stat k="Mark" v={fmtPrice(market, mark)} />
         <Stat k="Index" v={fmtPrice(market, mark - 1.4)} />
         <Stat k="Funding 1h" v="+0.0042%" />
@@ -128,6 +316,7 @@ function MarkRibbon({ market, mark }: { market: MarketConfig; mark: number }) {
   }
   return (
     <div className="flex flex-wrap items-center gap-5 font-mono text-xs tabular-nums">
+      {tag}
       <Stat k="Mark" v={fmtPrice(market, mark)} />
       <Stat k="Implied" v={`${(mark * 100).toFixed(1)}%`} />
       <Stat k="Window" v={market.window ?? "—"} />
@@ -148,41 +337,36 @@ function Stat({ k, v, pos }: { k: string; v: string; pos?: boolean }) {
   );
 }
 
-function OrderBook({ market, mark }: { market: MarketConfig; mark: number }) {
-  const [seed, setSeed] = useState(0);
+function OrderBook({
+  market,
+  frame,
+  isLive,
+}: {
+  market: MarketConfig;
+  frame: Snapshot | undefined;
+  isLive: boolean;
+}) {
   const status = useFeedStatus(market.symbol);
-  useEffect(() => {
-    const id = setInterval(() => setSeed((s) => s + 1), 900);
-    return () => clearInterval(id);
-  }, []);
-
-  const rows = useMemo(() => {
-    void seed;
-    const asks = Array.from({ length: 9 }, (_, i) => ({
-      px: mark + (i + 1) * market.tick,
-      qty: +(Math.random() * 4 + 0.2).toFixed(2),
-    })).reverse();
-    const bids = Array.from({ length: 9 }, (_, i) => ({
-      px: mark - (i + 1) * market.tick,
-      qty: +(Math.random() * 4 + 0.2).toFixed(2),
-    }));
-    return { asks, bids };
-  }, [mark, seed, market]);
-
-  if (status === "loading") return <OrderBookSkeleton />;
-
+  if (status === "loading" || !frame) return <OrderBookSkeleton />;
 
   return (
     <div className="rounded-lg border border-border bg-card/50 p-3">
-      <p className="px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-        Order book
-      </p>
+      <div className="flex items-center justify-between px-1">
+        <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          Order book
+        </p>
+        {!isLive && (
+          <p className="font-mono text-[10px] uppercase tracking-wide text-accent">
+            snapshot @ {new Date(frame.t).toLocaleTimeString([], { hour12: false })}
+          </p>
+        )}
+      </div>
       <div className="mt-2 grid grid-cols-2 px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
         <span>Price</span>
         <span className="text-right">Size</span>
       </div>
       <div className="mt-1 space-y-0.5 font-mono text-xs tabular-nums">
-        {rows.asks.map((r, i) => (
+        {frame.asks.map((r, i) => (
           <div key={`a-${i}`} className="relative grid grid-cols-2 px-1 py-0.5">
             <span
               className="absolute inset-y-0 right-0 bg-destructive/10"
@@ -193,10 +377,10 @@ function OrderBook({ market, mark }: { market: MarketConfig; mark: number }) {
           </div>
         ))}
         <div className="my-1 flex items-center justify-between border-y border-border px-1 py-1 font-mono text-[11px]">
-          <span className="text-foreground">{fmtPrice(market, mark)}</span>
+          <span className="text-foreground">{fmtPrice(market, frame.mark)}</span>
           <span className="text-muted-foreground">spread {fmtPrice(market, market.tick)}</span>
         </div>
-        {rows.bids.map((r, i) => (
+        {frame.bids.map((r, i) => (
           <div key={`b-${i}`} className="relative grid grid-cols-2 px-1 py-0.5">
             <span
               className="absolute inset-y-0 right-0 bg-live/10"
@@ -211,33 +395,33 @@ function OrderBook({ market, mark }: { market: MarketConfig; mark: number }) {
   );
 }
 
-const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h"] as const;
-type Timeframe = (typeof TIMEFRAMES)[number];
-const TF_DRIFT: Record<Timeframe, number> = { "1m": 1, "5m": 1.8, "15m": 2.6, "1h": 3.6, "4h": 5 };
-
-function ChartPanel({ market, mark }: { market: MarketConfig; mark: number }) {
-  const [tf, setTf] = useState<Timeframe>("1m");
-  const [series, setSeries] = useState<number[]>([]);
+function ChartPanel({
+  market,
+  frames,
+  viewId,
+  onScrub,
+  isLive,
+  decisions,
+}: {
+  market: MarketConfig;
+  frames: Snapshot[];
+  viewId: number | null;
+  onScrub: (id: number | null) => void;
+  isLive: boolean;
+  decisions: Decision[];
+}) {
   const status = useFeedStatus(market.symbol);
 
-  // Seed a fresh series whenever the market or timeframe changes.
-  useEffect(() => {
-    const n = 72;
-    const step = market.volatility * TF_DRIFT[tf];
-    let v = market.base;
-    const arr: number[] = [];
-    for (let i = 0; i < n; i++) {
-      v += (Math.random() - 0.5) * step;
-      if (market.type !== "perp") v = Math.min(0.95, Math.max(0.05, v));
-      arr.push(v);
-    }
-    setSeries(arr);
-  }, [market, tf]);
+  const visibleEnd = useMemo(() => {
+    if (viewId === null) return frames.length;
+    const idx = frames.findIndex((f) => f.id === viewId);
+    return idx === -1 ? frames.length : idx + 1;
+  }, [frames, viewId]);
 
-  // Append the live mark so the line keeps moving.
-  useEffect(() => {
-    setSeries((prev) => (prev.length ? [...prev.slice(1), mark] : prev));
-  }, [mark]);
+  const series = useMemo(
+    () => frames.slice(0, visibleEnd).map((f) => f.mark),
+    [frames, visibleEnd],
+  );
 
   const { path, area, lo, hi } = useMemo(() => {
     if (series.length < 2) return { path: "", area: "", lo: 0, hi: 0 };
@@ -254,33 +438,56 @@ function ChartPanel({ market, mark }: { market: MarketConfig; mark: number }) {
     return { path, area: `${path} L 600,100 L 0,100 Z`, lo, hi };
   }, [series]);
 
-  const open = series[0] ?? market.base;
+  // Project decision markers into chart-space using only the visible window.
+  const visible = frames.slice(0, visibleEnd);
+  const markers = useMemo(() => {
+    if (visible.length < 2) return [] as { x: number; y: number; d: Decision }[];
+    const lo2 = Math.min(...visible.map((f) => f.mark));
+    const hi2 = Math.max(...visible.map((f) => f.mark));
+    const span = hi2 - lo2 || 1;
+    const stepX = 600 / (visible.length - 1);
+    return decisions
+      .map((d) => {
+        const idx = visible.findIndex((f) => f.id === d.frameId);
+        if (idx === -1) return null;
+        return {
+          x: idx * stepX,
+          y: 90 - ((d.px - lo2) / span) * 78 - 6,
+          d,
+        };
+      })
+      .filter(Boolean) as { x: number; y: number; d: Decision }[];
+  }, [visible, decisions]);
+
   const close = series[series.length - 1] ?? market.base;
+  const open = series[0] ?? market.base;
   const up = close >= open;
 
   if (status === "loading" || series.length < 2)
-    return <ChartSkeleton label={`${market.symbol} · ${tf}`} />;
+    return <ChartSkeleton label={`${market.symbol} · time-travel`} />;
 
+  const sliderMax = Math.max(1, frames.length);
+  const sliderVal = viewId === null ? sliderMax : visibleEnd;
+  const viewFrame = frames[visibleEnd - 1];
 
   return (
     <div className="flex flex-col rounded-lg border border-border bg-card/50 p-3">
       <div className="flex items-center justify-between px-1">
         <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-          {market.symbol} · {tf}
+          {market.symbol} · glass-box chart
         </p>
-        <div className="flex gap-1 font-mono text-[10px] text-muted-foreground">
-          {TIMEFRAMES.map((t) => (
+        <div className="flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
+          {isLive ? (
+            <span className="text-live">● streaming</span>
+          ) : (
             <button
-              key={t}
               type="button"
-              onClick={() => setTf(t)}
-              className={`rounded border border-border px-1.5 py-0.5 transition-colors hover:bg-secondary ${
-                t === tf ? "bg-secondary text-foreground" : ""
-              }`}
+              onClick={() => onScrub(null)}
+              className="rounded border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-accent hover:bg-accent/20"
             >
-              {t}
+              return to live
             </button>
-          ))}
+          )}
         </div>
       </div>
       <svg viewBox="0 0 600 100" preserveAspectRatio="none" className="mt-2 h-56 w-full">
@@ -292,8 +499,51 @@ function ChartPanel({ market, mark }: { market: MarketConfig; mark: number }) {
         </defs>
         {area && <path d={area} fill="url(#chart-fill)" />}
         {path && <path d={path} fill="none" stroke="oklch(0.78 0.16 152)" strokeWidth="1.2" />}
+        {markers.map(({ x, y, d }) => (
+          <g key={d.id} onClick={() => onScrub(d.frameId)} className="cursor-pointer">
+            <line
+              x1={x}
+              x2={x}
+              y1={0}
+              y2={100}
+              stroke={d.side === "BUY" ? "oklch(0.78 0.16 152)" : "oklch(0.65 0.22 25)"}
+              strokeOpacity={d.frameId === viewId ? 0.7 : 0.18}
+              strokeWidth={d.frameId === viewId ? 0.8 : 0.4}
+            />
+            <circle
+              cx={x}
+              cy={y}
+              r={d.frameId === viewId ? 1.8 : 1.2}
+              fill={d.side === "BUY" ? "oklch(0.78 0.16 152)" : "oklch(0.65 0.22 25)"}
+            />
+          </g>
+        ))}
       </svg>
-      <div className="mt-auto grid grid-cols-4 gap-2 border-t border-border px-1 pt-2 font-mono text-[11px] tabular-nums text-muted-foreground">
+      <div className="mt-2 flex items-center gap-3 px-1">
+        <span className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          T-{frames.length - visibleEnd}
+        </span>
+        <Slider
+          value={[sliderVal]}
+          min={1}
+          max={sliderMax}
+          step={1}
+          onValueChange={([v]) => {
+            if (v >= sliderMax) onScrub(null);
+            else {
+              const f = frames[v - 1];
+              if (f) onScrub(f.id);
+            }
+          }}
+          className="flex-1"
+        />
+        <span className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          {viewFrame
+            ? new Date(viewFrame.t).toLocaleTimeString([], { hour12: false })
+            : "—"}
+        </span>
+      </div>
+      <div className="mt-3 grid grid-cols-4 gap-2 border-t border-border px-1 pt-2 font-mono text-[11px] tabular-nums text-muted-foreground">
         <span>O {fmtPrice(market, open)}</span>
         <span>H {fmtPrice(market, hi || close)}</span>
         <span>L {fmtPrice(market, lo || open)}</span>
@@ -314,7 +564,6 @@ function OrderTicket({ market, mark }: { market: MarketConfig; mark: number }) {
   const isPerp = market.type === "perp";
   const sizeLabel = isPerp ? "Size (BTC)" : "Size (shares)";
 
-  // Reset the ticket when the market changes.
   useEffect(() => {
     setPrice(fmtPrice(market, market.base).replace(/,/g, ""));
     setQty(market.type === "perp" ? "0.10" : "100");
@@ -444,64 +693,108 @@ function OrderTicket({ market, mark }: { market: MarketConfig; mark: number }) {
   );
 }
 
-type Fill = { id: string; side: Side; px: number; qty: number; t: number };
-
-function makeFill(market: MarketConfig, mark: number): Fill {
-  return {
-    id: Math.random().toString(36).slice(2, 8),
-    side: Math.random() > 0.5 ? "BUY" : "SELL",
-    px: mark + (Math.random() - 0.5) * market.tick * 6,
-    qty:
-      market.type === "perp"
-        ? +(0.02 + Math.random() * 1.2).toFixed(2)
-        : +(5 + Math.random() * 80).toFixed(0),
-    t: Date.now(),
-  };
-}
-
-function RecentFills({ market, mark }: { market: MarketConfig; mark: number }) {
-  const [fills, setFills] = useState<Fill[]>([]);
-
-  // Reset the tape when the market changes.
-  useEffect(() => {
-    setFills(Array.from({ length: 8 }, () => makeFill(market, market.base)));
-  }, [market]);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      setFills((prev) => [makeFill(market, mark), ...prev].slice(0, 10));
-    }, 2200);
-    return () => clearInterval(id);
-    // mark intentionally excluded — interval reads the latest via closure recreate
-  }, [market, mark]);
+function ThoughtStream({
+  market,
+  decisions,
+  activeFrameId,
+  onJump,
+}: {
+  market: MarketConfig;
+  decisions: Decision[];
+  activeFrameId: number | null;
+  onJump: (d: Decision) => void;
+}) {
+  const [open, setOpen] = useState<string | null>(null);
 
   return (
     <div className="rounded-lg border border-border bg-card/50 p-3">
-      <p className="px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-        Recent fills
-      </p>
-      <div className="mt-2 grid grid-cols-4 px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-        <span>Side</span>
-        <span className="text-right">Price</span>
-        <span className="text-right">Size</span>
-        <span className="text-right">Time</span>
+      <div className="flex items-center justify-between px-1">
+        <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          Agent thought stream
+        </p>
+        <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          {decisions.length} decisions
+        </p>
       </div>
-      <div className="mt-1 divide-y divide-border font-mono text-xs tabular-nums">
-        {fills.map((f) => (
-          <div key={f.id} className="grid grid-cols-4 px-1 py-1">
-            <span className={f.side === "BUY" ? "text-live" : "text-destructive"}>{f.side}</span>
-            <span className="text-right">{fmtPrice(market, f.px)}</span>
-            <span className="text-right text-muted-foreground">{f.qty}</span>
-            <span className="text-right text-muted-foreground">
-              {new Date(f.t).toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              })}
-            </span>
-          </div>
-        ))}
-      </div>
+      {decisions.length === 0 ? (
+        <p className="mt-6 px-1 pb-4 text-center font-mono text-[11px] text-muted-foreground">
+          waiting for agent to find an edge…
+        </p>
+      ) : (
+        <ul className="mt-2 divide-y divide-border font-mono text-xs">
+          {decisions.map((d) => {
+            const isOpen = open === d.id;
+            const isActive = activeFrameId === d.frameId;
+            return (
+              <li key={d.id}>
+                <button
+                  type="button"
+                  onClick={() => setOpen(isOpen ? null : d.id)}
+                  className={`grid w-full grid-cols-[60px_70px_1fr_70px_70px] items-center gap-2 px-1 py-2 text-left tabular-nums transition-colors hover:bg-secondary/50 ${
+                    isActive ? "bg-accent/5" : ""
+                  }`}
+                >
+                  <span className={d.side === "BUY" ? "text-live" : "text-destructive"}>
+                    {d.side}
+                  </span>
+                  <span className="text-muted-foreground">{d.qty}</span>
+                  <span className="truncate text-foreground/80">{d.id}</span>
+                  <span className="text-right text-muted-foreground">
+                    {fmtPrice(market, d.px)}
+                  </span>
+                  <span className="text-right text-muted-foreground">
+                    {new Date(d.t).toLocaleTimeString([], { hour12: false })}
+                  </span>
+                </button>
+                {isOpen && (
+                  <div className="space-y-3 border-t border-border bg-background/40 px-3 py-3 animate-fade-in">
+                    <div className="flex items-center justify-between">
+                      <p className="font-mono text-[10px] uppercase tracking-wide text-accent">
+                        Inner monologue
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => onJump(d)}
+                        className="rounded border border-accent/40 bg-accent/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-accent hover:bg-accent/20"
+                      >
+                        rewind chart →
+                      </button>
+                    </div>
+                    <p className="font-mono text-[11px] leading-relaxed text-foreground/80">
+                      {d.monologue}
+                    </p>
+                    <div>
+                      <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+                        Triggers ({d.triggers.filter((t) => t.pass).length}/{d.triggers.length} pass) · conviction {(d.conviction * 100).toFixed(0)}%
+                      </p>
+                      <ul className="mt-1 grid gap-1 sm:grid-cols-2">
+                        {d.triggers.map((t) => (
+                          <li
+                            key={t.label}
+                            className="flex items-center justify-between rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px] tabular-nums"
+                          >
+                            <span className="flex items-center gap-1.5 text-muted-foreground">
+                              <span
+                                className={
+                                  t.pass ? "text-live" : "text-destructive"
+                                }
+                              >
+                                {t.pass ? "●" : "○"}
+                              </span>
+                              {t.label}
+                            </span>
+                            <span className="text-foreground">{t.value}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }
