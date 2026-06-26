@@ -94,6 +94,12 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:site", content: "@Lovable" },
+      { name: "twitter:title", content: "RAETH — Agentic Exchange" },
+      { name: "description", content: "A decentralized exchange (DEX) builder for creating custom cryptocurrency trading platforms." },
+      { property: "og:description", content: "A decentralized exchange (DEX) builder for creating custom cryptocurrency trading platforms." },
+      { name: "twitter:description", content: "A decentralized exchange (DEX) builder for creating custom cryptocurrency trading platforms." },
+      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/10beee86-4706-48aa-a3ca-e717f2f11e39/id-preview-c9c5ec16--b3062b4e-2bb2-4cf7-a454-f3e002e17abc.lovable.app-1782442554527.png" },
+      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/10beee86-4706-48aa-a3ca-e717f2f11e39/id-preview-c9c5ec16--b3062b4e-2bb2-4cf7-a454-f3e002e17abc.lovable.app-1782442554527.png" },
     ],
     links: [
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
