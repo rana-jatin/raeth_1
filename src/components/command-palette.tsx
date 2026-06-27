@@ -10,7 +10,17 @@ import {
   CommandSeparator,
   CommandShortcut,
 } from "@/components/ui/command";
-import { LineChart, Bot, BookOpen, Home, Layers, Wallet, Key, Activity } from "lucide-react";
+import {
+  LineChart,
+  Bot,
+  BookOpen,
+  Home,
+  Layers,
+  Wallet,
+  Key,
+  Activity,
+  Trophy,
+} from "lucide-react";
 
 type Ctx = { open: boolean; setOpen: (v: boolean) => void };
 const CommandPaletteCtx = createContext<Ctx | null>(null);
@@ -67,6 +77,10 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
             <CommandItem onSelect={() => go("/trade")}>
               <LineChart /> <span>Trade terminal</span>
               <CommandShortcut>T</CommandShortcut>
+            </CommandItem>
+            <CommandItem onSelect={() => go("/arena")}>
+              <Trophy /> <span>Strategy Arena</span>
+              <CommandShortcut>A</CommandShortcut>
             </CommandItem>
             <CommandItem onSelect={() => go("/markets")}>
               <Layers /> <span>Markets</span>

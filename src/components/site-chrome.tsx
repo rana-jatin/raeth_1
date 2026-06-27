@@ -6,6 +6,7 @@ import { useCommandPalette } from "./command-palette";
 
 export const NAV: { label: string; to: string }[] = [
   { label: "Trade", to: "/trade" },
+  { label: "Arena", to: "/arena" },
   { label: "HFT", to: "/markets" },
   { label: "Betting", to: "/markets" },
   { label: "Markets", to: "/markets" },
@@ -13,7 +14,9 @@ export const NAV: { label: string; to: string }[] = [
   { label: "Leaderboard", to: "/markets" },
   { label: "Portfolio", to: "/agents" },
   { label: "Connect agent", to: "/agents" },
+  { label: "Analytics", to: "/analytics" },
   { label: "Docs", to: "/docs" },
+  { label: "Support", to: "/support" },
 ];
 
 export function TopBanner() {
@@ -53,7 +56,9 @@ export function Header() {
                   to={item.to}
                   onClick={() => setNavOpen(false)}
                   className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
-                  activeProps={{ className: "rounded-md px-3 py-2 text-sm text-foreground bg-secondary" }}
+                  activeProps={{
+                    className: "rounded-md px-3 py-2 text-sm text-foreground bg-secondary",
+                  }}
                   activeOptions={{ exact: item.to === "/" }}
                 >
                   {item.label}
@@ -126,12 +131,28 @@ export function Footer() {
           </span>
           <span className="font-mono text-[9px] text-accent">AI</span>
         </div>
-        <p className="font-mono">Testnet · No real money at risk · Built on an event-sourced ledger</p>
+        <p className="font-mono">
+          Testnet · No real money at risk · Built on an event-sourced ledger
+        </p>
         <div className="flex gap-4">
-          <Link to="/trade" className="hover:text-foreground">Trade</Link>
-          <Link to="/docs" className="hover:text-foreground">Docs</Link>
-          <Link to="/agents" className="hover:text-foreground">Agents</Link>
-          <Link to="/markets" className="hover:text-foreground">Markets</Link>
+          <Link to="/trade" search={{ symbol: "BTC-PERP" }} className="hover:text-foreground">
+            Trade
+          </Link>
+          <Link to="/docs" className="hover:text-foreground">
+            Docs
+          </Link>
+          <Link to="/agents" className="hover:text-foreground">
+            Agents
+          </Link>
+          <Link to="/markets" className="hover:text-foreground">
+            Markets
+          </Link>
+          <Link to="/analytics" className="hover:text-foreground">
+            Analytics
+          </Link>
+          <Link to="/support" className="hover:text-foreground">
+            Support
+          </Link>
         </div>
       </div>
     </footer>

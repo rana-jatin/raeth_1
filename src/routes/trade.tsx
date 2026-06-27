@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Pause, Play, SkipBack, SkipForward, Gauge } from "lucide-react";
 import { PageShell } from "../components/site-chrome";
 import {
   ChartSkeleton,
@@ -8,16 +9,15 @@ import {
   useFeedStatus,
 } from "../components/panel-states";
 import { Slider } from "../components/ui/slider";
+import { RiskFirewall } from "../components/risk-firewall";
 import { getRequestOrigin } from "../lib/origin.functions";
 import ogTrade from "../assets/og/trade.jpg";
-import {
-  MARKETS,
-  fmtPrice,
-  getMarket,
-  normalizeSymbol,
-  useLiveMark,
-  type MarketConfig,
-} from "../lib/markets";
+import { MARKETS, fmtPrice, getMarket, normalizeSymbol, type MarketConfig } from "../lib/markets";
+import { createBotState } from "../lib/agents/presets";
+import { evaluateRisk, withBlockedRecorded, withSubmissionRecorded } from "../lib/agents/risk";
+import { applyFillToBot } from "../lib/agents/accounting";
+import { recomputeMetrics } from "../lib/agents/metrics";
+import type { BotState, DecisionDraft, RiskVerdict } from "../lib/agents/types";
 
 export const Route = createFileRoute("/trade")({
   validateSearch: (search: Record<string, unknown>): { symbol: string } => ({
@@ -66,8 +66,10 @@ type Snapshot = {
 };
 
 type Trigger = { label: string; value: string; pass: boolean };
+type DecisionStatus = "pending" | "partial" | "filled" | "expired";
 type Decision = {
   id: string;
+  orderId?: number;
   frameId: number;
   t: number;
   side: Side;
@@ -76,22 +78,47 @@ type Decision = {
   conviction: number; // 0..1
   monologue: string;
   triggers: Trigger[];
+  // Glass-box risk + PnL (#1)
+  riskLimit: string;
+  maxLossUsd: number;
+  leverage: number;
+  expectedPnl: number;
+  actualPnl: number | null;
+  status: DecisionStatus;
+  // internal fill accounting
+  _filledQty: number;
+  _fillPx: number;
+  _fees: number;
+};
+
+/** A discrete order-book event, recorded per frame for time-travel replay (#2). */
+type TLEvent = {
+  frameId: number;
+  t: number;
+  kind: "accepted" | "trade" | "cancelled" | "filled" | "blocked";
+  text: string;
+  side?: Side;
+  agent?: boolean;
+};
+
+/** Loosely-typed event emitted by the matching worker (fields vary by kind). */
+type WorkerEvent = {
+  type: string;
+  id: number;
+  side: Side;
+  price: number;
+  qty: number;
+  remaining: number;
+  maker_id: number;
+  taker_id: number;
 };
 
 const FRAME_CAP = 180;
 const FRAME_MS = 850;
-
-function makeBook(market: MarketConfig, mark: number) {
-  const asks = Array.from({ length: 9 }, (_, i) => ({
-    px: mark + (i + 1) * market.tick,
-    qty: +(Math.random() * 4 + 0.2).toFixed(2),
-  })).reverse();
-  const bids = Array.from({ length: 9 }, (_, i) => ({
-    px: mark - (i + 1) * market.tick,
-    qty: +(Math.random() * 4 + 0.2).toFixed(2),
-  }));
-  return { asks, bids };
-}
+const TL_CAP = 240;
+const DEC_CAP = 40;
+const FEE_RATE = 0.0005;
+const SPEEDS = [0.5, 1, 2, 4];
 
 function bookImbalance(b: BookLevel[], a: BookLevel[]) {
   const bq = b.reduce((s, r) => s + r.qty, 0);
@@ -103,57 +130,335 @@ function bookImbalance(b: BookLevel[], a: BookLevel[]) {
 function TradePage() {
   const { symbol } = Route.useSearch();
   const market = getMarket(symbol);
-  const mark = useLiveMark(market);
 
   const [frames, setFrames] = useState<Snapshot[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [timeline, setTimeline] = useState<TLEvent[]>([]);
   const [viewId, setViewId] = useState<number | null>(null); // null = live
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const [agentBot, setAgentBot] = useState<BotState>(() => createBotState("momentum", market));
+  const [lastVerdict, setLastVerdict] = useState<RiskVerdict | null>(null);
+  const [userOrders, setUserOrders] = useState<
+    Record<number, { id: number; side: Side; price: number; qty: number; remaining: number }>
+  >({});
+  const [positions, setPositions] = useState<
+    Record<string, { side: Side | null; size: number; entry: number }>
+  >({});
+  const [userTrades, setUserTrades] = useState<
+    { id: string; side: Side; price: number; qty: number; t: number; symbol: string }[]
+  >([]);
+  const [mark, setMark] = useState(market.base);
+
+  const framesRef = useRef<Snapshot[]>([]);
+  const decisionsRef = useRef<Decision[]>([]);
+  const decisionMapRef = useRef<Map<string, Decision>>(new Map());
+  const agentOrderToDecisionRef = useRef<Map<number, string>>(new Map());
+  const agentBotRef = useRef<BotState>(agentBot);
   const frameSeq = useRef(0);
+  const decSeq = useRef(0);
   const lastDecision = useRef(0);
+  const pendingDecisionRef = useRef<Omit<
+    Decision,
+    | "id"
+    | "orderId"
+    | "t"
+    | "px"
+    | "qty"
+    | "actualPnl"
+    | "status"
+    | "_filledQty"
+    | "_fillPx"
+    | "_fees"
+  > | null>(null);
+  const workerRef = useRef<Worker | null>(null);
 
-  // Reset history when the market changes.
-  useEffect(() => {
-    setFrames([]);
-    setDecisions([]);
-    setViewId(null);
-    frameSeq.current = 0;
-    lastDecision.current = 0;
-  }, [market]);
+  const flushDecisions = useCallback(() => {
+    setDecisions(decisionsRef.current.map((d) => ({ ...d })));
+  }, []);
 
-  // Drive a single shared tick that produces snapshots + occasional agent decisions.
+  const reconcileAgentDecision = useCallback((decId: string, price: number, qty: number) => {
+    const dec = decisionMapRef.current.get(decId);
+    if (!dec) return;
+    const newQty = dec._filledQty + qty;
+    dec._fillPx = newQty > 0 ? (dec._fillPx * dec._filledQty + price * qty) / newQty : price;
+    dec._filledQty = newQty;
+    dec._fees += price * qty * FEE_RATE;
+    dec.status = dec._filledQty >= dec.qty - 1e-9 ? "filled" : "partial";
+  }, []);
+
+  // Scan events: update user state, agent fills, decisions, and the replay timeline.
+  const processEvents = useCallback(
+    (
+      events: WorkerEvent[],
+      symbolStr: string,
+      frameId: number,
+      isUserOrder?: boolean,
+      isAgentOrder?: boolean,
+    ) => {
+      const tl: TLEvent[] = [];
+      let decisionsTouched = false;
+
+      events.forEach((ev) => {
+        if (ev.type === "accepted") {
+          tl.push({
+            frameId,
+            t: Date.now(),
+            kind: "accepted",
+            side: ev.side,
+            text: `order ${ev.id} accepted · ${ev.side} ${ev.qty} @ ${ev.price}`,
+            agent: isAgentOrder,
+          });
+          if (isUserOrder) {
+            setUserOrders((prev) => ({
+              ...prev,
+              [ev.id]: {
+                id: ev.id,
+                side: ev.side,
+                price: ev.price,
+                qty: ev.qty,
+                remaining: ev.qty,
+              },
+            }));
+          } else if (isAgentOrder && pendingDecisionRef.current) {
+            const d0 = pendingDecisionRef.current;
+            const decision: Decision = {
+              id: `dec_${(++decSeq.current).toString().padStart(5, "0")}`,
+              orderId: ev.id,
+              frameId: d0.frameId,
+              t: Date.now(),
+              side: d0.side,
+              px: ev.price,
+              qty: ev.qty,
+              conviction: d0.conviction,
+              monologue: d0.monologue,
+              triggers: d0.triggers,
+              riskLimit: d0.riskLimit,
+              maxLossUsd: d0.maxLossUsd,
+              leverage: d0.leverage,
+              expectedPnl: d0.expectedPnl,
+              actualPnl: null,
+              status: "pending",
+              _filledQty: 0,
+              _fillPx: 0,
+              _fees: 0,
+            };
+            decisionsRef.current = [decision, ...decisionsRef.current].slice(0, DEC_CAP);
+            decisionMapRef.current.set(decision.id, decision);
+            agentOrderToDecisionRef.current.set(ev.id, decision.id);
+            decisionsTouched = true;
+            pendingDecisionRef.current = null;
+          }
+        } else if (ev.type === "trade") {
+          const makerDec = agentOrderToDecisionRef.current.get(ev.maker_id);
+          const takerDec = agentOrderToDecisionRef.current.get(ev.taker_id);
+          if (makerDec || takerDec) {
+            const isMaker = !!makerDec;
+            const agentSide: Side = isMaker ? (ev.side === "BUY" ? "SELL" : "BUY") : ev.side;
+            agentBotRef.current = applyFillToBot(
+              agentBotRef.current,
+              agentSide,
+              ev.price,
+              ev.qty,
+            ).bot;
+            reconcileAgentDecision((makerDec ?? takerDec)!, ev.price, ev.qty);
+            decisionsTouched = true;
+            tl.push({
+              frameId,
+              t: Date.now(),
+              kind: "trade",
+              side: agentSide,
+              text: `agent fill · ${agentSide} ${ev.qty} @ ${ev.price}`,
+              agent: true,
+            });
+          } else {
+            tl.push({
+              frameId,
+              t: Date.now(),
+              kind: "trade",
+              side: ev.side,
+              text: `trade · ${ev.qty} @ ${ev.price}`,
+            });
+          }
+
+          // User position tracking (unchanged behavior).
+          setUserOrders((prev) => {
+            const next = { ...prev };
+            const makerId = ev.maker_id;
+            const takerId = ev.taker_id;
+            let matchedUserOrder = false;
+            let userSide: Side = "BUY";
+
+            if (next[makerId]) {
+              next[makerId].remaining = Math.max(0, next[makerId].remaining - ev.qty);
+              if (next[makerId].remaining === 0) delete next[makerId];
+              matchedUserOrder = true;
+              userSide = next[makerId] ? next[makerId].side : ev.side === "BUY" ? "SELL" : "BUY";
+            }
+            if (next[takerId]) {
+              next[takerId].remaining = Math.max(0, next[takerId].remaining - ev.qty);
+              if (next[takerId].remaining === 0) delete next[takerId];
+              matchedUserOrder = true;
+              userSide = ev.side;
+            }
+
+            if (matchedUserOrder) {
+              setUserTrades((prevTrades) => [
+                {
+                  id: `trd_${makerId}_${takerId}`,
+                  side: userSide,
+                  price: ev.price,
+                  qty: ev.qty,
+                  t: Date.now(),
+                  symbol: symbolStr,
+                },
+                ...prevTrades,
+              ]);
+              setPositions((prevPositions) => {
+                const currentPos = prevPositions[symbolStr] || { side: null, size: 0, entry: 0 };
+                const tradeQty = ev.qty;
+                const tradePrice = ev.price;
+                let newSide = currentPos.side;
+                let newSize = currentPos.size;
+                let newEntry = currentPos.entry;
+                if (currentPos.side === null) {
+                  newSide = userSide;
+                  newSize = tradeQty;
+                  newEntry = tradePrice;
+                } else if (currentPos.side === userSide) {
+                  newEntry =
+                    (currentPos.entry * currentPos.size + tradePrice * tradeQty) /
+                    (currentPos.size + tradeQty);
+                  newSize = currentPos.size + tradeQty;
+                } else {
+                  if (currentPos.size > tradeQty) newSize = currentPos.size - tradeQty;
+                  else if (currentPos.size === tradeQty) {
+                    newSide = null;
+                    newSize = 0;
+                    newEntry = 0;
+                  } else {
+                    newSide = userSide;
+                    newSize = tradeQty - currentPos.size;
+                    newEntry = tradePrice;
+                  }
+                }
+                return {
+                  ...prevPositions,
+                  [symbolStr]: {
+                    side: newSide,
+                    size: parseFloat(newSize.toFixed(4)),
+                    entry: parseFloat(newEntry.toFixed(2)),
+                  },
+                };
+              });
+            }
+            return next;
+          });
+        } else if (ev.type === "cancelled" || ev.type === "filled") {
+          tl.push({
+            frameId,
+            t: Date.now(),
+            kind: ev.type,
+            side: ev.side,
+            text: `order ${ev.id} ${ev.type}`,
+          });
+          const decId = agentOrderToDecisionRef.current.get(ev.id);
+          if (ev.type === "cancelled" && decId) {
+            const d = decisionMapRef.current.get(decId);
+            if (d && d._filledQty <= 0) {
+              d.status = "expired";
+              d.actualPnl = 0;
+              decisionsTouched = true;
+            }
+          }
+          setUserOrders((prev) => {
+            const next = { ...prev };
+            if (next[ev.id]) delete next[ev.id];
+            return next;
+          });
+        }
+      });
+
+      if (tl.length) setTimeline((prev) => [...tl.reverse(), ...prev].slice(0, TL_CAP));
+      if (decisionsTouched) {
+        setAgentBot(agentBotRef.current);
+        flushDecisions();
+      }
+    },
+    [flushDecisions, reconcileAgentDecision],
+  );
+
+  // Initialize Worker & handle state updates.
   useEffect(() => {
-    const id = setInterval(() => {
-      setFrames((prev) => {
-        const { asks, bids } = makeBook(market, mark);
-        const prevMark = prev.length ? prev[prev.length - 1].mark : mark;
-        const ema = prev.length
-          ? prev[prev.length - 1].ind.ema * 0.85 + mark * 0.15
-          : mark;
-        const drift = mark - prevMark;
+    const worker = new Worker(new URL("../workers/matching.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    workerRef.current = worker;
+    worker.postMessage({ type: "INIT" });
+
+    worker.onmessage = (e) => {
+      const { type, data, events, isUser, isAgent, error } = e.data;
+      if (type === "INIT_DONE") {
+        worker.postMessage({
+          type: "RESET",
+          data: { symbol: market.symbol, base: market.base, tick: market.tick, type: market.type },
+        });
+      } else if (type === "RESET_DONE") {
+        framesRef.current = [];
+        decisionsRef.current = [];
+        decisionMapRef.current.clear();
+        agentOrderToDecisionRef.current.clear();
+        agentBotRef.current = createBotState("momentum", market);
+        setFrames([]);
+        setDecisions([]);
+        setTimeline([]);
+        setAgentBot(agentBotRef.current);
+        setLastVerdict(null);
+        setUserOrders({});
+        setMark(market.base);
+        setViewId(null);
+        setPlaying(false);
+        frameSeq.current = 0;
+        lastDecision.current = 0;
+      } else if (type === "TICK_DONE") {
+        const { midPrice, bids, asks, events: tickEvents } = data;
+        setMark(midPrice);
+
+        const prev = framesRef.current;
+        const last = prev[prev.length - 1];
+        const nextEma = last ? last.ind.ema * 0.85 + midPrice * 0.15 : midPrice;
+        const drift = midPrice - (last ? last.mark : midPrice);
         const rsi = Math.max(5, Math.min(95, 50 + drift * 800));
         const imb = bookImbalance(bids, asks);
         const vol = Math.abs(drift) / Math.max(1e-6, market.volatility);
         const snap: Snapshot = {
           id: ++frameSeq.current,
           t: Date.now(),
-          mark,
+          mark: midPrice,
           bids,
           asks,
-          ind: { ema, rsi, imb, vol },
+          ind: { ema: nextEma, rsi, imb, vol },
         };
 
-        // Agent decision logic — fires when several signals align.
+        // Glass-box momentum agent: decide → risk-gate → submit (#1, #5).
         const sinceLast = snap.t - lastDecision.current;
-        if (sinceLast > 2600 && Math.random() > 0.55) {
-          const bullish = imb > 0.08 && mark > ema && rsi < 70;
-          const bearish = imb < -0.08 && mark < ema && rsi > 30;
+        if (sinceLast > 3200 && Math.random() > 0.65) {
+          const bullish = imb > 0.08 && midPrice > nextEma && rsi < 70;
+          const bearish = imb < -0.08 && midPrice < nextEma && rsi > 30;
           if (bullish || bearish) {
             lastDecision.current = snap.t;
             const side: Side = bullish ? "BUY" : "SELL";
-            const conviction = Math.min(
-              0.99,
-              0.45 + Math.abs(imb) * 1.6 + Math.abs(mark - ema) / (ema || 1) * 60,
-            );
+            const edgeFrac = Math.abs(midPrice - nextEma) / (nextEma || 1);
+            const conviction = Math.min(0.99, 0.45 + Math.abs(imb) * 1.6 + edgeFrac * 60);
+            const qty =
+              market.type === "perp"
+                ? +(0.05 + conviction * 0.6).toFixed(2)
+                : +(20 + conviction * 120).toFixed(0);
+            const crossP =
+              side === "BUY"
+                ? (asks[0]?.px ?? midPrice + market.tick)
+                : (bids[0]?.px ?? midPrice - market.tick);
+            const expectedPnl = +(crossP * qty * edgeFrac * conviction).toFixed(2);
             const triggers: Trigger[] = [
               {
                 label: "Book imbalance",
@@ -162,59 +467,183 @@ function TradePage() {
               },
               {
                 label: "Mark vs EMA(20)",
-                value: `${(((mark - ema) / (ema || 1)) * 100).toFixed(2)}%`,
-                pass: bullish ? mark > ema : mark < ema,
+                value: `${(((midPrice - nextEma) / (nextEma || 1)) * 100).toFixed(2)}%`,
+                pass: bullish ? midPrice > nextEma : midPrice < nextEma,
               },
-              {
-                label: "RSI(14)",
-                value: rsi.toFixed(1),
-                pass: bullish ? rsi < 70 : rsi > 30,
-              },
-              {
-                label: "Vol regime",
-                value: vol.toFixed(2),
-                pass: vol < 2.2,
-              },
+              { label: "RSI(14)", value: rsi.toFixed(1), pass: bullish ? rsi < 70 : rsi > 30 },
+              { label: "Vol regime", value: vol.toFixed(2), pass: vol < 2.2 },
             ];
-            const qty = market.type === "perp"
-              ? +(0.05 + conviction * 0.6).toFixed(2)
-              : +(20 + conviction * 120).toFixed(0);
             const monologue = bullish
-              ? `Bid stack outweighs offers (${(imb * 100).toFixed(1)}% imbalance) while mark sits ${(((mark - ema) / (ema || 1)) * 1e4).toFixed(0)}bps above EMA(20). RSI ${rsi.toFixed(0)} leaves room before overbought. Lifting ${qty} ${market.symbol} at ${fmtPrice(market, mark)} with conviction ${(conviction * 100).toFixed(0)}%.`
-              : `Offers dominate (${(imb * 100).toFixed(1)}% imbalance) and mark broke ${(((ema - mark) / (ema || 1)) * 1e4).toFixed(0)}bps under EMA(20). RSI ${rsi.toFixed(0)} not yet oversold — fading strength. Hitting bid for ${qty} ${market.symbol} at ${fmtPrice(market, mark)}, conviction ${(conviction * 100).toFixed(0)}%.`;
-            const decision: Decision = {
-              id: `ord_${snap.id.toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+              ? `Bid stack outweighs offers (${(imb * 100).toFixed(1)}% imbalance) while mark sits ${(((midPrice - nextEma) / (nextEma || 1)) * 1e4).toFixed(0)}bps above EMA(20). Lifting ${qty} ${market.symbol} at ${fmtPrice(market, crossP)}.`
+              : `Offers dominate (${(imb * 100).toFixed(1)}% imbalance) and mark broke ${(((nextEma - midPrice) / (nextEma || 1)) * 1e4).toFixed(0)}bps under EMA(20). Hitting bid for ${qty} ${market.symbol} at ${fmtPrice(market, crossP)}.`;
+
+            const draft: DecisionDraft = {
               frameId: snap.id,
-              t: snap.t,
               side,
-              px: mark,
+              px: crossP,
               qty,
               conviction,
               monologue,
               triggers,
+              expectedPnl,
+              tif: "GTC",
             };
-            setDecisions((d) => [decision, ...d].slice(0, 40));
+            const verdict = evaluateRisk(draft, agentBotRef.current, snap.t);
+            setLastVerdict(verdict);
+
+            if (agentBotRef.current.paused || !verdict.allow) {
+              agentBotRef.current = withBlockedRecorded(agentBotRef.current, snap.t);
+              const blocker = verdict.alerts.find((a) => a.severity === "block");
+              const blockedEv: TLEvent = {
+                frameId: snap.id,
+                t: snap.t,
+                kind: "blocked",
+                side,
+                text: `🛡 firewall blocked ${side} ${qty} — ${agentBotRef.current.paused ? "agent paused" : (blocker?.message ?? "risk limit")}`,
+                agent: true,
+              };
+              setTimeline((prevTl) => [blockedEv, ...prevTl].slice(0, TL_CAP));
+            } else {
+              agentBotRef.current = withSubmissionRecorded(
+                agentBotRef.current,
+                side,
+                snap.id,
+                snap.t,
+              );
+              pendingDecisionRef.current = {
+                frameId: snap.id,
+                side,
+                conviction,
+                monologue,
+                triggers,
+                riskLimit: verdict.riskLimit,
+                maxLossUsd: verdict.maxLossUsd,
+                leverage: verdict.leverage,
+                expectedPnl,
+              };
+              worker.postMessage({
+                type: "SUBMIT_LIMIT",
+                data: { side, price: crossP, qty, tif: "GTC", isAgent: true },
+              });
+            }
           }
         }
 
-        const next = [...prev, snap];
-        if (next.length > FRAME_CAP) next.splice(0, next.length - FRAME_CAP);
-        return next;
-      });
+        framesRef.current = [...prev, snap].slice(-FRAME_CAP);
+        setFrames([...framesRef.current]);
+
+        processEvents(tickEvents, market.symbol, snap.id, false, false);
+
+        // Mark-to-market live agent decisions + refresh agent metrics (#1).
+        let touched = false;
+        for (const d of decisionsRef.current) {
+          if (d._filledQty > 0) {
+            d.actualPnl = +(
+              d._filledQty * (midPrice - d._fillPx) * (d.side === "BUY" ? 1 : -1) -
+              d._fees
+            ).toFixed(2);
+            touched = true;
+          }
+        }
+        agentBotRef.current = {
+          ...agentBotRef.current,
+          metrics: recomputeMetrics(agentBotRef.current, midPrice, 0),
+        };
+        setAgentBot(agentBotRef.current);
+        if (touched) flushDecisions();
+      } else if (type === "ORDER_EVENT") {
+        const fid = framesRef.current[framesRef.current.length - 1]?.id ?? 0;
+        processEvents(events, market.symbol, fid, isUser, isAgent);
+      } else if (type === "ERROR") {
+        console.error("Worker error:", error);
+      }
+    };
+
+    return () => {
+      worker.terminate();
+    };
+  }, [market, processEvents, flushDecisions]);
+
+  // Tick timer.
+  useEffect(() => {
+    if (!workerRef.current) return;
+    const interval = setInterval(() => {
+      workerRef.current?.postMessage({ type: "TICK" });
     }, FRAME_MS);
+    return () => clearInterval(interval);
+  }, [market]);
+
+  // Time-travel playback: advance the view cursor while playing (#2).
+  useEffect(() => {
+    if (!playing) return;
+    const id = setInterval(() => {
+      setViewId((cur) => {
+        const list = framesRef.current;
+        if (list.length < 2) return cur;
+        const lastIdx = list.length - 1;
+        const idx = cur === null ? lastIdx : list.findIndex((f) => f.id === cur);
+        const nextIdx = idx + 1;
+        if (idx === -1 || nextIdx >= lastIdx) {
+          setPlaying(false);
+          return null; // caught up → live
+        }
+        return list[nextIdx].id;
+      });
+    }, FRAME_MS / speed);
     return () => clearInterval(id);
-  }, [market, mark]);
+  }, [playing, speed]);
+
+  const handleSubmitOrder = useCallback(
+    (side: Side, orderType: Order, price: number, qty: number) => {
+      if (orderType === "LIMIT") {
+        workerRef.current?.postMessage({
+          type: "SUBMIT_LIMIT",
+          data: { side, price, qty, tif: "GTC" },
+        });
+      } else {
+        workerRef.current?.postMessage({ type: "SUBMIT_MARKET", data: { side, qty } });
+      }
+    },
+    [],
+  );
+
+  const handleCancelOrder = useCallback((orderId: number) => {
+    workerRef.current?.postMessage({ type: "CANCEL", data: { orderId } });
+  }, []);
 
   const liveFrame = frames[frames.length - 1];
   const viewFrame =
-    viewId === null
-      ? liveFrame
-      : frames.find((f) => f.id === viewId) ?? liveFrame;
+    viewId === null ? liveFrame : (frames.find((f) => f.id === viewId) ?? liveFrame);
   const isLive = viewId === null;
 
   const jumpToDecision = useCallback((d: Decision) => {
+    setPlaying(false);
     setViewId(d.frameId);
   }, []);
+
+  const stepView = useCallback((dir: -1 | 1) => {
+    setPlaying(false);
+    setViewId((cur) => {
+      const list = framesRef.current;
+      if (list.length < 2) return cur;
+      const lastIdx = list.length - 1;
+      const idx = cur === null ? lastIdx : list.findIndex((f) => f.id === cur);
+      const nextIdx = Math.max(0, Math.min(lastIdx, idx + dir));
+      return nextIdx >= lastIdx ? null : list[nextIdx].id;
+    });
+  }, []);
+
+  const cycleSpeed = useCallback(() => {
+    setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]);
+  }, []);
+
+  const replay = {
+    playing,
+    speed,
+    onTogglePlay: () => setPlaying((p) => !p),
+    onStep: stepView,
+    onCycleSpeed: cycleSpeed,
+  };
 
   return (
     <PageShell>
@@ -244,9 +673,10 @@ function TradePage() {
               onScrub={setViewId}
               isLive={isLive}
               decisions={decisions}
+              replay={replay}
             />
           </PanelErrorBoundary>
-          <OrderTicket market={market} mark={mark} />
+          <OrderTicket market={market} mark={mark} onSubmitOrder={handleSubmitOrder} />
         </div>
 
         <div className="mt-3 grid gap-3 lg:grid-cols-[1.4fr_1fr]">
@@ -256,7 +686,30 @@ function TradePage() {
             activeFrameId={viewFrame?.id ?? null}
             onJump={jumpToDecision}
           />
-          <PositionsTable />
+          <PositionsAndOrders
+            market={market}
+            positions={positions}
+            userOrders={userOrders}
+            onCancel={handleCancelOrder}
+          />
+        </div>
+
+        <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_1fr]">
+          <RiskFirewall
+            bot={agentBot}
+            mark={mark}
+            verdict={lastVerdict}
+            onTogglePause={(paused) => {
+              agentBotRef.current = { ...agentBotRef.current, paused };
+              setAgentBot(agentBotRef.current);
+            }}
+          />
+          <EventTicker
+            market={market}
+            events={timeline}
+            viewFrameId={isLive ? null : (viewFrame?.id ?? null)}
+            isLive={isLive}
+          />
         </div>
       </section>
     </PageShell>
@@ -330,7 +783,9 @@ function Stat({ k, v, pos }: { k: string; v: string; pos?: boolean }) {
   return (
     <div className="flex flex-col">
       <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{k}</span>
-      <span className={pos === undefined ? "text-foreground" : pos ? "text-live" : "text-destructive"}>
+      <span
+        className={pos === undefined ? "text-foreground" : pos ? "text-live" : "text-destructive"}
+      >
         {v}
       </span>
     </div>
@@ -395,6 +850,14 @@ function OrderBook({
   );
 }
 
+type ReplayControls = {
+  playing: boolean;
+  speed: number;
+  onTogglePlay: () => void;
+  onStep: (dir: -1 | 1) => void;
+  onCycleSpeed: () => void;
+};
+
 function ChartPanel({
   market,
   frames,
@@ -402,6 +865,7 @@ function ChartPanel({
   onScrub,
   isLive,
   decisions,
+  replay,
 }: {
   market: MarketConfig;
   frames: Snapshot[];
@@ -409,6 +873,7 @@ function ChartPanel({
   onScrub: (id: number | null) => void;
   isLive: boolean;
   decisions: Decision[];
+  replay: ReplayControls;
 }) {
   const status = useFeedStatus(market.symbol);
 
@@ -519,10 +984,40 @@ function ChartPanel({
           </g>
         ))}
       </svg>
-      <div className="mt-2 flex items-center gap-3 px-1">
-        <span className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-          T-{frames.length - visibleEnd}
-        </span>
+
+      {/* Time-travel transport controls (#2) */}
+      <div className="mt-2 flex items-center gap-1.5 px-1">
+        <button
+          type="button"
+          onClick={() => replay.onStep(-1)}
+          className="rounded border border-border p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+          aria-label="Step back"
+        >
+          <SkipBack className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={replay.onTogglePlay}
+          className={`rounded border p-1 ${replay.playing ? "border-accent/50 bg-accent/10 text-accent" : "border-border text-muted-foreground hover:bg-secondary hover:text-foreground"}`}
+          aria-label={replay.playing ? "Pause replay" : "Play replay"}
+        >
+          {replay.playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+        </button>
+        <button
+          type="button"
+          onClick={() => replay.onStep(1)}
+          className="rounded border border-border p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+          aria-label="Step forward"
+        >
+          <SkipForward className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={replay.onCycleSpeed}
+          className="ml-1 flex items-center gap-1 rounded border border-border px-1.5 py-1 font-mono text-[10px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+        >
+          <Gauge className="h-3 w-3" /> {replay.speed}×
+        </button>
         <Slider
           value={[sliderVal]}
           min={1}
@@ -535,14 +1030,13 @@ function ChartPanel({
               if (f) onScrub(f.id);
             }
           }}
-          className="flex-1"
+          className="ml-2 flex-1"
         />
         <span className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-          {viewFrame
-            ? new Date(viewFrame.t).toLocaleTimeString([], { hour12: false })
-            : "—"}
+          {viewFrame ? new Date(viewFrame.t).toLocaleTimeString([], { hour12: false }) : "—"}
         </span>
       </div>
+
       <div className="mt-3 grid grid-cols-4 gap-2 border-t border-border px-1 pt-2 font-mono text-[11px] tabular-nums text-muted-foreground">
         <span>O {fmtPrice(market, open)}</span>
         <span>H {fmtPrice(market, hi || close)}</span>
@@ -553,7 +1047,15 @@ function ChartPanel({
   );
 }
 
-function OrderTicket({ market, mark }: { market: MarketConfig; mark: number }) {
+function OrderTicket({
+  market,
+  mark,
+  onSubmitOrder,
+}: {
+  market: MarketConfig;
+  mark: number;
+  onSubmitOrder: (side: Side, orderType: Order, price: number, qty: number) => void;
+}) {
   const [side, setSide] = useState<Side>("BUY");
   const [order, setOrder] = useState<Order>("LIMIT");
   const [price, setPrice] = useState(fmtPrice(market, market.base).replace(/,/g, ""));
@@ -576,7 +1078,8 @@ function OrderTicket({ market, mark }: { market: MarketConfig; mark: number }) {
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    setSubmitted({ id: `ord_${Math.random().toString(36).slice(2, 8)}`, side });
+    onSubmitOrder(side, order, parseFloat(price), parseFloat(qty));
+    setSubmitted({ id: `ord_user_${Math.random().toString(36).slice(2, 6)}`, side });
     setTimeout(() => setSubmitted(null), 3500);
   };
 
@@ -725,12 +1228,18 @@ function ThoughtStream({
           {decisions.map((d) => {
             const isOpen = open === d.id;
             const isActive = activeFrameId === d.frameId;
+            const pnlTone =
+              d.actualPnl === null
+                ? "text-muted-foreground"
+                : d.actualPnl >= 0
+                  ? "text-live"
+                  : "text-destructive";
             return (
               <li key={d.id}>
                 <button
                   type="button"
                   onClick={() => setOpen(isOpen ? null : d.id)}
-                  className={`grid w-full grid-cols-[60px_70px_1fr_70px_70px] items-center gap-2 px-1 py-2 text-left tabular-nums transition-colors hover:bg-secondary/50 ${
+                  className={`grid w-full grid-cols-[58px_56px_1fr_64px_70px] items-center gap-2 px-1 py-2 text-left tabular-nums transition-colors hover:bg-secondary/50 ${
                     isActive ? "bg-accent/5" : ""
                   }`}
                 >
@@ -738,9 +1247,11 @@ function ThoughtStream({
                     {d.side}
                   </span>
                   <span className="text-muted-foreground">{d.qty}</span>
-                  <span className="truncate text-foreground/80">{d.id}</span>
-                  <span className="text-right text-muted-foreground">
-                    {fmtPrice(market, d.px)}
+                  <span className="truncate text-foreground/80">{d.monologue}</span>
+                  <span className={`text-right ${pnlTone}`}>
+                    {d.actualPnl === null
+                      ? `~$${d.expectedPnl.toFixed(0)}`
+                      : `${d.actualPnl >= 0 ? "+" : ""}$${d.actualPnl.toFixed(0)}`}
                   </span>
                   <span className="text-right text-muted-foreground">
                     {new Date(d.t).toLocaleTimeString([], { hour12: false })}
@@ -763,9 +1274,35 @@ function ThoughtStream({
                     <p className="font-mono text-[11px] leading-relaxed text-foreground/80">
                       {d.monologue}
                     </p>
+
+                    {/* Risk limit + expected vs actual PnL (#1) */}
+                    <div className="grid gap-1 sm:grid-cols-2">
+                      <div className="flex items-center justify-between rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px] tabular-nums">
+                        <span className="text-muted-foreground">Risk limit used</span>
+                        <span className="text-foreground">{d.riskLimit}</span>
+                      </div>
+                      <div className="flex items-center justify-between rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px] tabular-nums">
+                        <span className="text-muted-foreground">Max loss</span>
+                        <span className="text-foreground">${d.maxLossUsd.toFixed(0)}</span>
+                      </div>
+                      <div className="flex items-center justify-between rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px] tabular-nums">
+                        <span className="text-muted-foreground">Expected PnL</span>
+                        <span className="text-foreground">~${d.expectedPnl.toFixed(2)}</span>
+                      </div>
+                      <div className="flex items-center justify-between rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px] tabular-nums">
+                        <span className="text-muted-foreground">Actual PnL ({d.status})</span>
+                        <span className={pnlTone}>
+                          {d.actualPnl === null
+                            ? "—"
+                            : `${d.actualPnl >= 0 ? "+" : ""}$${d.actualPnl.toFixed(2)}`}
+                        </span>
+                      </div>
+                    </div>
+
                     <div>
                       <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                        Triggers ({d.triggers.filter((t) => t.pass).length}/{d.triggers.length} pass) · conviction {(d.conviction * 100).toFixed(0)}%
+                        Triggers ({d.triggers.filter((t) => t.pass).length}/{d.triggers.length}{" "}
+                        pass) · conviction {(d.conviction * 100).toFixed(0)}%
                       </p>
                       <ul className="mt-1 grid gap-1 sm:grid-cols-2">
                         {d.triggers.map((t) => (
@@ -774,11 +1311,7 @@ function ThoughtStream({
                             className="flex items-center justify-between rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px] tabular-nums"
                           >
                             <span className="flex items-center gap-1.5 text-muted-foreground">
-                              <span
-                                className={
-                                  t.pass ? "text-live" : "text-destructive"
-                                }
-                              >
+                              <span className={t.pass ? "text-live" : "text-destructive"}>
                                 {t.pass ? "●" : "○"}
                               </span>
                               {t.label}
@@ -799,35 +1332,185 @@ function ThoughtStream({
   );
 }
 
-function PositionsTable() {
+const TL_COLOR: Record<TLEvent["kind"], string> = {
+  accepted: "text-muted-foreground",
+  trade: "text-accent",
+  filled: "text-live",
+  cancelled: "text-yellow-400",
+  blocked: "text-destructive",
+};
+
+function EventTicker({
+  market,
+  events,
+  viewFrameId,
+  isLive,
+}: {
+  market: MarketConfig;
+  events: TLEvent[];
+  viewFrameId: number | null;
+  isLive: boolean;
+}) {
+  const shown = isLive ? events.slice(0, 40) : events.filter((e) => e.frameId === viewFrameId);
+
   return (
     <div className="rounded-lg border border-border bg-card/50 p-3">
-      <p className="px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-        Positions
-      </p>
-      <div className="mt-2 grid grid-cols-5 px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-        <span>Market</span>
-        <span className="text-right">Side</span>
-        <span className="text-right">Size</span>
-        <span className="text-right">Entry</span>
-        <span className="text-right">PnL</span>
+      <div className="flex items-center justify-between px-1">
+        <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          Event ticker {market.symbol}
+        </p>
+        <p className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+          {isLive ? "live tape" : `frame snapshot · ${shown.length} events`}
+        </p>
       </div>
-      <div className="mt-1 divide-y divide-border font-mono text-xs tabular-nums">
-        <div className="grid grid-cols-5 px-1 py-2">
-          <span>BTC-PERP</span>
-          <span className="text-right text-live">LONG</span>
-          <span className="text-right">0.42</span>
-          <span className="text-right">64,812.0</span>
-          <span className="text-right text-live">+$50.10</span>
-        </div>
-        <div className="grid grid-cols-5 px-1 py-2">
-          <span>BTC-UPDOWN</span>
-          <span className="text-right text-destructive">SHORT</span>
-          <span className="text-right">35</span>
-          <span className="text-right">0.524</span>
-          <span className="text-right text-destructive">−$3.20</span>
-        </div>
+      <div className="mt-2 h-48 overflow-y-auto font-mono text-[11px] leading-relaxed">
+        {shown.length === 0 ? (
+          <p className="mt-6 text-center text-muted-foreground">
+            {isLive ? "waiting for order flow…" : "no events at this frame"}
+          </p>
+        ) : (
+          shown.map((e, i) => (
+            <div
+              key={`${e.frameId}-${i}`}
+              className={`flex items-center gap-2 ${TL_COLOR[e.kind]}`}
+            >
+              <span className="text-muted-foreground/60">
+                {new Date(e.t).toLocaleTimeString([], { hour12: false })}
+              </span>
+              {e.agent && (
+                <span className="rounded bg-accent/15 px-1 text-[9px] uppercase tracking-wide text-accent">
+                  agent
+                </span>
+              )}
+              <span className="truncate">{e.text}</span>
+            </div>
+          ))
+        )}
       </div>
+    </div>
+  );
+}
+
+function PositionsAndOrders({
+  market,
+  positions,
+  userOrders,
+  onCancel,
+}: {
+  market: MarketConfig;
+  positions: Record<string, { side: Side | null; size: number; entry: number }>;
+  userOrders: Record<
+    number,
+    { id: number; side: Side; price: number; qty: number; remaining: number }
+  >;
+  onCancel: (orderId: number) => void;
+}) {
+  const [tab, setTab] = useState<"positions" | "orders">("positions");
+
+  const posList = Object.entries(positions).filter(([_, pos]) => pos.side !== null);
+  const orderList = Object.values(userOrders);
+
+  return (
+    <div className="rounded-lg border border-border bg-card/50 p-3 flex flex-col h-[280px]">
+      <div className="flex border-b border-border font-mono text-[10px] uppercase tracking-wide">
+        <button
+          onClick={() => setTab("positions")}
+          className={`pb-1.5 px-3 -mb-[1px] border-b-2 font-medium ${
+            tab === "positions"
+              ? "border-accent text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Positions ({posList.length})
+        </button>
+        <button
+          onClick={() => setTab("orders")}
+          className={`pb-1.5 px-3 -mb-[1px] border-b-2 font-medium ${
+            tab === "orders"
+              ? "border-accent text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Open Orders ({orderList.length})
+        </button>
+      </div>
+
+      {tab === "positions" ? (
+        <div className="mt-3 flex-1 overflow-y-auto">
+          <div className="grid grid-cols-5 px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground pb-2 border-b border-border/50">
+            <span>Market</span>
+            <span className="text-right">Side</span>
+            <span className="text-right">Size</span>
+            <span className="text-right">Entry</span>
+            <span className="text-right">PnL</span>
+          </div>
+          <div className="divide-y divide-border/30 font-mono text-xs tabular-nums">
+            {posList.length === 0 ? (
+              <p className="py-8 text-center text-muted-foreground">No active positions</p>
+            ) : (
+              posList.map(([symbol, pos]) => {
+                const isBull = pos.side === "BUY";
+                const mkt = getMarket(symbol);
+                const currentMark = symbol === market.symbol ? market.base : mkt.base;
+                const pnl = pos.size * (currentMark - pos.entry) * (isBull ? 1 : -1);
+
+                return (
+                  <div key={symbol} className="grid grid-cols-5 px-1 py-2 items-center">
+                    <span className="font-semibold">{symbol}</span>
+                    <span
+                      className={`text-right font-medium ${isBull ? "text-live" : "text-destructive"}`}
+                    >
+                      {isBull ? "LONG" : "SHORT"}
+                    </span>
+                    <span className="text-right">{pos.size}</span>
+                    <span className="text-right">{pos.entry.toLocaleString()}</span>
+                    <span
+                      className={`text-right font-semibold ${pnl >= 0 ? "text-live" : "text-destructive"}`}
+                    >
+                      {pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}
+                    </span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 flex-1 overflow-y-auto">
+          <div className="grid grid-cols-5 px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground pb-2 border-b border-border/50">
+            <span>Side</span>
+            <span className="text-right">Price</span>
+            <span className="text-right">Qty</span>
+            <span className="text-right">Rem</span>
+            <span className="text-right">Action</span>
+          </div>
+          <div className="divide-y divide-border/30 font-mono text-xs tabular-nums">
+            {orderList.length === 0 ? (
+              <p className="py-8 text-center text-muted-foreground">No open orders</p>
+            ) : (
+              orderList.map((ord) => {
+                const isBuy = ord.side === "BUY";
+                return (
+                  <div key={ord.id} className="grid grid-cols-5 px-1 py-1.5 items-center">
+                    <span className={isBuy ? "text-live" : "text-destructive"}>{ord.side}</span>
+                    <span className="text-right">{ord.price.toLocaleString()}</span>
+                    <span className="text-right">{ord.qty}</span>
+                    <span className="text-right">{ord.remaining}</span>
+                    <div className="text-right">
+                      <button
+                        onClick={() => onCancel(ord.id)}
+                        className="rounded border border-destructive/40 bg-destructive/10 px-2 py-0.5 text-[10px] font-semibold text-destructive hover:bg-destructive/20 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

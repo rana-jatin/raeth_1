@@ -10,14 +10,22 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as TradeRouteImport } from './routes/trade'
+import { Route as SupportRouteImport } from './routes/support'
 import { Route as MarketsRouteImport } from './routes/markets'
 import { Route as DocsRouteImport } from './routes/docs'
+import { Route as ArenaRouteImport } from './routes/arena'
+import { Route as AnalyticsRouteImport } from './routes/analytics'
 import { Route as AgentsRouteImport } from './routes/agents'
 import { Route as IndexRouteImport } from './routes/index'
 
 const TradeRoute = TradeRouteImport.update({
   id: '/trade',
   path: '/trade',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SupportRoute = SupportRouteImport.update({
+  id: '/support',
+  path: '/support',
   getParentRoute: () => rootRouteImport,
 } as any)
 const MarketsRoute = MarketsRouteImport.update({
@@ -28,6 +36,16 @@ const MarketsRoute = MarketsRouteImport.update({
 const DocsRoute = DocsRouteImport.update({
   id: '/docs',
   path: '/docs',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ArenaRoute = ArenaRouteImport.update({
+  id: '/arena',
+  path: '/arena',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AnalyticsRoute = AnalyticsRouteImport.update({
+  id: '/analytics',
+  path: '/analytics',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AgentsRoute = AgentsRouteImport.update({
@@ -44,38 +62,75 @@ const IndexRoute = IndexRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/agents': typeof AgentsRoute
+  '/analytics': typeof AnalyticsRoute
+  '/arena': typeof ArenaRoute
   '/docs': typeof DocsRoute
   '/markets': typeof MarketsRoute
+  '/support': typeof SupportRoute
   '/trade': typeof TradeRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/agents': typeof AgentsRoute
+  '/analytics': typeof AnalyticsRoute
+  '/arena': typeof ArenaRoute
   '/docs': typeof DocsRoute
   '/markets': typeof MarketsRoute
+  '/support': typeof SupportRoute
   '/trade': typeof TradeRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/agents': typeof AgentsRoute
+  '/analytics': typeof AnalyticsRoute
+  '/arena': typeof ArenaRoute
   '/docs': typeof DocsRoute
   '/markets': typeof MarketsRoute
+  '/support': typeof SupportRoute
   '/trade': typeof TradeRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/agents' | '/docs' | '/markets' | '/trade'
+  fullPaths:
+    | '/'
+    | '/agents'
+    | '/analytics'
+    | '/arena'
+    | '/docs'
+    | '/markets'
+    | '/support'
+    | '/trade'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/agents' | '/docs' | '/markets' | '/trade'
-  id: '__root__' | '/' | '/agents' | '/docs' | '/markets' | '/trade'
+  to:
+    | '/'
+    | '/agents'
+    | '/analytics'
+    | '/arena'
+    | '/docs'
+    | '/markets'
+    | '/support'
+    | '/trade'
+  id:
+    | '__root__'
+    | '/'
+    | '/agents'
+    | '/analytics'
+    | '/arena'
+    | '/docs'
+    | '/markets'
+    | '/support'
+    | '/trade'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AgentsRoute: typeof AgentsRoute
+  AnalyticsRoute: typeof AnalyticsRoute
+  ArenaRoute: typeof ArenaRoute
   DocsRoute: typeof DocsRoute
   MarketsRoute: typeof MarketsRoute
+  SupportRoute: typeof SupportRoute
   TradeRoute: typeof TradeRoute
 }
 
@@ -86,6 +141,13 @@ declare module '@tanstack/react-router' {
       path: '/trade'
       fullPath: '/trade'
       preLoaderRoute: typeof TradeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/support': {
+      id: '/support'
+      path: '/support'
+      fullPath: '/support'
+      preLoaderRoute: typeof SupportRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/markets': {
@@ -100,6 +162,20 @@ declare module '@tanstack/react-router' {
       path: '/docs'
       fullPath: '/docs'
       preLoaderRoute: typeof DocsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/arena': {
+      id: '/arena'
+      path: '/arena'
+      fullPath: '/arena'
+      preLoaderRoute: typeof ArenaRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/analytics': {
+      id: '/analytics'
+      path: '/analytics'
+      fullPath: '/analytics'
+      preLoaderRoute: typeof AnalyticsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/agents': {
@@ -122,10 +198,23 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AgentsRoute: AgentsRoute,
+  AnalyticsRoute: AnalyticsRoute,
+  ArenaRoute: ArenaRoute,
   DocsRoute: DocsRoute,
   MarketsRoute: MarketsRoute,
+  SupportRoute: SupportRoute,
   TradeRoute: TradeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
+
+import type { getRouter } from './router.tsx'
+import type { startInstance } from './start.ts'
+declare module '@tanstack/react-start' {
+  interface Register {
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
+    config: Awaited<ReturnType<typeof startInstance.getOptions>>
+  }
+}
