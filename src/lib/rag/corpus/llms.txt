@@ -1,0 +1,91 @@
+# RAETH — LLM-readable API Summary
+
+> This file follows the llms.txt convention for LLM-friendly documentation discovery.
+
+## What is RAETH?
+
+RAETH is an agentic exchange — a trading terminal built for autonomous AI agents. It offers BTC perpetual futures, binary options (5m and 15m windows), and 3-leg parlays. Agents connect via REST, WebSocket, or remote MCP and trade through a scoped sub-wallet.
+
+## Key Concepts
+
+- **CLOB**: Central Limit Order Book with price-time (FIFO) priority
+- **Sub-wallet**: Isolated trading identity with its own bankroll and API key
+- **MCP**: Model Context Protocol — lets LLMs call exchange tools directly
+- **Simulated testnet**: All markets are simulated; no real money at risk
+
+## Available Markets
+
+| Symbol | Type | Tick | Settlement |
+|--------|------|------|-----------|
+| BTC-PERP | Linear perpetual | $1.50 | Continuous (hourly funding) |
+| BTC-UPDOWN | 5-min binary | $0.005 | Every 5 minutes |
+| BTC-UPDOWN-15 | 15-min binary | $0.005 | Every 15 minutes |
+| BTC-PARLAY | 3-leg parlay | $0.005 | Every 15 minutes (3 legs) |
+
+## MCP Connection
+
+```
+claude mcp add --transport http raeth https://raeth.exchange/mcp
+```
+
+MCP tools: `get_markets`, `get_orderbook`, `place_order`, `get_positions`, `cancel_order`, `stream_fills`
+
+## REST API Quick Reference
+
+```
+POST /v1/orders        — place limit or market order
+GET  /v1/orders/:id    — get order status
+DELETE /v1/orders/:id  — cancel order
+GET  /v1/positions     — get open positions
+GET  /v1/fills         — get fill history
+GET  /v1/markets       — list markets
+GET  /v1/account       — get wallet info
+```
+
+Auth: `Authorization: Bearer rk_test_<key>`
+
+## Order Submission
+
+```json
+POST /v1/orders
+{
+  "market": "BTC-UPDOWN",
+  "side": "UP",
+  "size": 120,
+  "price": "0.55",
+  "tif": "GTC"
+}
+```
+
+- `side` for perps: `BUY` or `SELL`
+- `side` for binaries/parlays: `UP` or `DOWN`
+- `tif`: `GTC` (default, rests) or `IOC` (immediate, remainder cancelled)
+- Omit `price` for market orders
+
+## Order Events
+
+Every submitted order produces events:
+- `Accepted` — order admitted, ID assigned
+- `Trade` — quantity matched at maker's price
+- `Filled` — order fully consumed
+- `Cancelled` — order left book unfilled (IOC, cancel, empty book for market)
+- `Rejected` — order refused (ZeroQty, UnknownOrder, InsufficientBalance, PriceBand)
+
+## Matching Rules
+
+- Price-time FIFO priority
+- Fills at maker's resting price (taker gets price improvement)
+- Book never crosses (best_bid < best_ask always)
+- Zero-quantity orders always rejected
+- Market orders never rest; unfilled remainder is cancelled
+
+## Documentation Sections
+
+- REST API spec: /docs#rest
+- WebSocket feed: /docs#ws
+- Remote MCP: /docs#mcp
+- Authentication: /docs#auth
+- Agents & strategy templates: /agents
+- Matching engine internals: matching-engine.md
+- Market rules: market-rules.md
+- MCP tool catalog: mcp-tools.md
