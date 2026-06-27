@@ -1,4 +1,4 @@
-# RAETH — The trading terminal for autonomous market agents
+# RAETH - The trading terminal for autonomous market agents
 
 RAETH is an **agentic exchange demo**: a glass-box trading venue where every order, fill,
 and settlement runs through a real matching engine, and where AI agents trade the *same*
@@ -10,7 +10,7 @@ through read-only MCP-style tools.
 > **Status: demo / portfolio project.** No real money is involved. Market data is
 > simulated, accounts are seeded with a $10,000 testnet bankroll, and the public exchange
 > API (`raeth.exchange` REST/WebSocket/MCP) shown on the Docs page is **illustrative
-> narrative copy** — it is not a live, deployed public endpoint. The matching, the agent
+> narrative copy** - it is not a live, deployed public endpoint. The matching, the agent
 > arena, the support bot, and the NL strategy builder, however, all really run.
 
 ---
@@ -39,16 +39,16 @@ trade.
 The whole point of RAETH is making an autonomous trader **inspectable**. Everything below is
 client-side and simulated, built on the shared agent core in [`src/lib/agents/`](src/lib/agents/).
 
-1. **Glass-Box ThoughtStream** *(`/trade`)* — every agent decision is rendered with its risk
+1. **Glass-Box ThoughtStream** *(`/trade`)* - every agent decision is rendered with its risk
    check and its expected-vs-actual PnL, so you can see *why* it traded, not just that it did.
-2. **Time-Travel replay** *(`/trade`)* — play / step / speed controls over the event log plus
+2. **Time-Travel replay** *(`/trade`)* - play / step / speed controls over the event log plus
    an event ticker; scrub a market window forward and back deterministically.
-3. **Strategy Arena** *(`/arena`)* — a leaderboard of bots running the five built-in
+3. **Strategy Arena** *(`/arena`)* - a leaderboard of bots running the five built-in
    strategies head-to-head, each with its own risk firewall.
-4. **Natural-language strategy builder** — describe a strategy in plain English; a Groq
+4. **Natural-language strategy builder** - describe a strategy in plain English; a Groq
    `llama-3.3-70b` server function (`src/lib/nl-strategy.ts`) parses it into a Zod-validated
    config (`src/lib/agents/strategy-schema.ts`) and arms a bot in the arena.
-5. **Risk Firewall** *(`/trade`, `/arena`)* — pre-trade risk evaluation and behavioral alerts
+5. **Risk Firewall** *(`/trade`, `/arena`)* - pre-trade risk evaluation and behavioral alerts
    (`src/lib/agents/risk.ts`) that gate and explain every order.
 
 ---
@@ -82,7 +82,7 @@ cp .env.example .env.local   # then add your GROQ_API_KEY
 npm run dev                   # http://localhost:8080
 ```
 
-The terminal, charts, order book, and Strategy Arena work without any API key — they run
+The terminal, charts, order book, and Strategy Arena work without any API key - they run
 entirely on the in-browser WASM engine. Only the AI features (support chat, NL strategy
 builder) require `GROQ_API_KEY`.
 
@@ -90,7 +90,7 @@ builder) require `GROQ_API_KEY`.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `GROQ_API_KEY` | for AI features | — | Groq key used by the support bot and NL strategy parser |
+| `GROQ_API_KEY` | for AI features | - | Groq key used by the support bot and NL strategy parser |
 | `GROQ_MODEL` | no | `llama-3.3-70b-versatile` | Override the Groq model |
 
 See [`.env.example`](.env.example) for details.
@@ -110,7 +110,7 @@ See [`.env.example`](.env.example) for details.
 | `npm run test` | Run the Vitest suite once |
 | `npm run test:watch` | Vitest in watch mode |
 
-> Use **npm** — a `package-lock.json` is committed. (A stale `bun.lock` also exists; ignore it.)
+> Use **npm** - a `package-lock.json` is committed. (A stale `bun.lock` also exists; ignore it.)
 
 ---
 
@@ -120,11 +120,11 @@ See [`.env.example`](.env.example) for details.
 | --- | --- |
 | `/` | Landing page + interactive sample-agent runner |
 | `/trade` | The trading terminal: book, chart, fills, order entry, Glass-Box ThoughtStream, Time-Travel, Risk Firewall |
-| `/arena` | Strategy Arena — bots competing on a leaderboard, NL strategy builder |
+| `/arena` | Strategy Arena - bots competing on a leaderboard, NL strategy builder |
 | `/markets` | Market list (BTC perpetual, BTC Up/Down binaries, parlays) |
 | `/agents` | Account / sub-wallet setup and the MCP tool catalog |
 | `/analytics` | Per-agent analytics |
-| `/docs` | Developer docs (REST / WebSocket / MCP quickstart — illustrative) |
+| `/docs` | Developer docs (REST / WebSocket / MCP quickstart - illustrative) |
 | `/support` | Groq-powered support assistant (RAG + read-only MCP tools) |
 
 ---
@@ -156,14 +156,14 @@ raeth/
 
 ## Notes & caveats
 
-- **`src/routeTree.gen.ts` is auto-generated** by the TanStack router plugin — don't edit it
+- **`src/routeTree.gen.ts` is auto-generated** by the TanStack router plugin - don't edit it
   by hand.
 - The agent platform is **simulated and client-side**: bots, fills, and PnL are computed in
   the browser against the WASM book. There is no real custody, settlement, or counterparty.
 - This project is connected to [Lovable](https://lovable.dev). Avoid force-pushing or
   rewriting published git history, since the connected branch syncs back to the editor (see
   [`AGENTS.md`](AGENTS.md)).
-- If you cloned `.env.example` from an earlier revision, **rotate any committed Groq key** —
+- If you cloned `.env.example` from an earlier revision, **rotate any committed Groq key** -
   treat keys in version control as compromised.
 
 ---

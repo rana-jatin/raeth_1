@@ -9,8 +9,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
 
   if (type === "INIT") {
     try {
-      const wasmUrl = new URL("../wasm/raeth_bg.wasm", import.meta.url);
-      await init(wasmUrl);
+      await init();
       self.postMessage({ type: "INIT_DONE" });
     } catch (err: any) {
       self.postMessage({ type: "ERROR", error: err.message });
@@ -22,7 +21,7 @@ self.addEventListener("message", async (e: MessageEvent) => {
 
     const initialMidTicks = BigInt(Math.round(base / tickSize));
     const seed = BigInt(Date.now() % 1000000007);
-    
+
     if (simulator) {
       simulator.free();
     }
@@ -36,10 +35,10 @@ self.addEventListener("message", async (e: MessageEvent) => {
     const result = JSON.parse(resultStr);
 
     const midPrice = result.mid * tickSize;
-    
+
     const bids: { px: number; qty: number }[] = [];
     const asks: { px: number; qty: number }[] = [];
-    
+
     // Group and aggregate resting orders by price levels
     const levelMap: Record<string, { bid: number; ask: number }> = {};
     for (const ord of result.snapshot) {
